@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 import io
 import json
 import logging
@@ -36,6 +38,7 @@ DEFAULT_BASE_URL = "http://127.0.0.1:30010"
 DEFAULT_MODEL = "Qwen3.6-27B-FP8"
 DEFAULT_CONTAINER_USER = "claude"
 DEFAULT_CONTAINER_HOME = "/home/claude"
+DEFAULT_TRACE_DIR = "/raid/zwx/SWE-bench/experiments/claude_qwen/traces"
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,6 +68,38 @@ def parse_args() -> argparse.Namespace:
         "--output",
         required=True,
         help="Predictions JSON path to write/update.",
+    )
+    parser.add_argument(
+        "--trace_dir",
+        default=DEFAULT_TRACE_DIR,
+        help=(
+            "Directory for realtime Claude Code traces. Files are written under "
+            "<trace_dir>/<run_id>/<instance_id>/."
+        ),
+    )
+    parser.add_argument(
+        "--trace_output_format",
+        default="stream-json",
+        choices=["text", "json", "stream-json"],
+        help="Claude Code output format to capture in realtime trace files.",
+    )
+    parser.add_argument(
+        "--include_partial_messages",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Include partial message chunks in Claude Code stream-json output. "
+            "Disabled by default so trace logs stay at complete JSON event granularity."
+        ),
+    )
+    parser.add_argument(
+        "--include_hook_events",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Include hook lifecycle events in Claude Code stream-json output. "
+            "Use --no-include_hook_events to disable."
+        ),
     )
     parser.add_argument(
         "--run_id",
@@ -128,6 +163,29 @@ def parse_args() -> argparse.Namespace:
         help="Timeout in seconds for each Claude Code solve attempt.",
     )
     parser.add_argument(
+        "--max_timeout",
+        type=int,
+        help=(
+            "Alias for --claude_timeout. When set, overrides --claude_timeout "
+            "for each Claude Code solve attempt."
+        ),
+    )
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        help=(
+            "Maximum number of Claude Code tool-task steps per instance. "
+            "Counts stream-json system/task_started events and terminates the "
+            "Claude exec when the limit is exceeded."
+        ),
+    )
+    parser.add_argument(
+        "--max_workers",
+        type=int,
+        default=1,
+        help="Maximum number of SWE-bench instances to solve concurrently.",
+    )
+    parser.add_argument(
         "--force_rebuild",
         action="store_true",
         help="Force rebuild local instance images. Ignored for remote namespace images.",
@@ -164,7 +222,14 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Do not pass Claude Code --dangerously-skip-permissions.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.max_timeout is not None:
+        args.claude_timeout = args.max_timeout
+    if args.max_workers < 1:
+        parser.error("--max_workers must be at least 1")
+    if args.max_steps is not None and args.max_steps < 1:
+        parser.error("--max_steps must be at least 1")
+    return args
 
 
 def load_existing_predictions(path: Path) -> dict[str, dict[str, Any]]:
@@ -178,6 +243,34 @@ def write_predictions(path: Path, predictions: dict[str, dict[str, Any]]) -> Non
     path.parent.mkdir(parents=True, exist_ok=True)
     ordered = sorted(predictions.values(), key=lambda item: item[KEY_INSTANCE_ID])
     path.write_text(json.dumps(ordered, indent=2, ensure_ascii=False) + "\n")
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def is_operation_event(event: dict[str, Any]) -> bool:
+    event_type = event.get("type")
+    subtype = event.get("subtype")
+    if event_type == "result":
+        return True
+    if event_type == "system" and isinstance(subtype, str):
+        return subtype.startswith("task_")
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("type") in {"tool_use", "tool_result"}
+        for item in content
+    )
 
 
 def make_solve_logger(run_id: str, instance_id: str) -> logging.Logger:
@@ -284,7 +377,10 @@ def exec_capture(
     workdir: str | None = None,
     user: str = "root",
     timeout: int | None = None,
-) -> tuple[int | None, str, bool, float]:
+    trace_stream_path: Path | None = None,
+    trace_operations_path: Path | None = None,
+    max_steps: int | None = None,
+) -> tuple[int | None, str, bool, float, str | None, int]:
     exec_id = client.api.exec_create(
         container=container_id,
         cmd=cmd,
@@ -296,37 +392,98 @@ def exec_capture(
     exception: Exception | None = None
     start = time.time()
     timed_out = False
+    stop_reason: str | None = None
+    step_count = 0
+    line_buffer = bytearray()
+
+    trace_stream_file = None
+    trace_operations_file = None
+    if trace_stream_path is not None:
+        trace_stream_path.parent.mkdir(parents=True, exist_ok=True)
+        trace_stream_file = trace_stream_path.open("wb")
+    if trace_operations_path is not None:
+        trace_operations_path.parent.mkdir(parents=True, exist_ok=True)
+        trace_operations_file = trace_operations_path.open("w", encoding="utf-8")
 
     def run() -> None:
-        nonlocal exception
+        nonlocal exception, step_count, stop_reason
         try:
             stream = client.api.exec_start(exec_id, stream=True)
             for chunk in stream:
                 output.extend(chunk)
+                if trace_stream_file is not None:
+                    trace_stream_file.write(chunk)
+                    trace_stream_file.flush()
+                if max_steps is not None or trace_operations_file is not None:
+                    line_buffer.extend(chunk)
+                    while b"\n" in line_buffer:
+                        line, _, rest = line_buffer.partition(b"\n")
+                        line_buffer[:] = rest
+                        if not line.strip():
+                            continue
+                        try:
+                            event = json.loads(line.decode("utf-8", errors="replace"))
+                        except json.JSONDecodeError:
+                            continue
+                        if (
+                            trace_operations_file is not None
+                            and is_operation_event(event)
+                        ):
+                            trace_operations_file.write(
+                                json.dumps(event, ensure_ascii=False) + "\n"
+                            )
+                            trace_operations_file.flush()
+                        if (
+                            event.get("type") == "system"
+                            and event.get("subtype") == "task_started"
+                        ):
+                            step_count += 1
+                            if step_count > max_steps and stop_reason is None:
+                                stop_reason = "max_steps_exceeded"
+                                inspect = client.api.exec_inspect(exec_id)
+                                pid = inspect.get("Pid")
+                                if pid:
+                                    kill_id = client.api.exec_create(
+                                        container=container_id,
+                                        cmd=["kill", "-TERM", str(pid)],
+                                        user="root",
+                                    )["Id"]
+                                    client.api.exec_start(kill_id)
+                                return
         except Exception as exc:
             exception = exc
 
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    thread.join(timeout)
-    if thread.is_alive():
+    try:
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            inspect = client.api.exec_inspect(exec_id)
+            pid = inspect.get("Pid")
+            if pid:
+                kill_id = client.api.exec_create(
+                    container=container_id,
+                    cmd=["kill", "-TERM", str(pid)],
+                    user="root",
+                )["Id"]
+                client.api.exec_start(kill_id)
+            timed_out = stop_reason is None
+            thread.join(5)
+        if exception is not None:
+            raise exception
+        elapsed = time.time() - start
         inspect = client.api.exec_inspect(exec_id)
-        pid = inspect.get("Pid")
-        if pid:
-            kill_id = client.api.exec_create(
-                container=container_id,
-                cmd=["kill", "-TERM", str(pid)],
-                user="root",
-            )["Id"]
-            client.api.exec_start(kill_id)
-        timed_out = True
-        thread.join(5)
-    if exception is not None:
-        raise exception
-    elapsed = time.time() - start
-    inspect = client.api.exec_inspect(exec_id)
-    text = output.decode("utf-8", errors="replace")
-    return inspect.get("ExitCode"), text, timed_out, elapsed
+        text = output.decode("utf-8", errors="replace")
+        return inspect.get("ExitCode"), text, timed_out, elapsed, stop_reason, step_count
+    finally:
+        if trace_stream_file is not None:
+            trace_stream_file.close()
+        if trace_operations_file is not None:
+            trace_operations_file.close()
+
+
+def make_trace_dir(args: argparse.Namespace, instance_id: str) -> Path:
+    return Path(args.trace_dir) / args.run_id / instance_id
 
 
 def create_solve_container(
@@ -358,11 +515,19 @@ def create_solve_container(
 
 def build_prompt(instance: dict[str, Any]) -> str:
     hints = instance.get("hints_text") or ""
+    step_limit = ""
+    max_steps = instance.get("_claude_max_steps")
+    if max_steps is not None:
+        step_limit = (
+            f"\nYou have a hard budget of at most {max_steps} tool-use steps. "
+            "Plan briefly, avoid exploratory loops, and finish before the step budget.\n"
+        )
     return f"""We need solve one SWE-bench task in this repository.
 
 You are inside the task repository at /testbed. Modify only the source files
 needed to fix the issue. Do not edit tests unless the issue explicitly requires
 test-source changes. Keep the patch minimal.
+{step_limit}
 
 Instance ID:
 {instance[KEY_INSTANCE_ID]}
@@ -438,6 +603,18 @@ def solve_instance(
         instance_image_tag=args.instance_image_tag,
     )
     logger = make_solve_logger(args.run_id, test_spec.instance_id)
+    trace_dir = make_trace_dir(args, test_spec.instance_id)
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    status_path = trace_dir / "status.json"
+    write_json(
+        status_path,
+        {
+            "instance_id": test_spec.instance_id,
+            "run_id": args.run_id,
+            "status": "starting",
+            "started_at": utc_now(),
+        },
+    )
     container = None
     try:
         logger.info("Starting solve for %s", test_spec.instance_id)
@@ -449,6 +626,9 @@ def solve_instance(
         version = install_claude(container, args)
         logger.info("Claude Code version in container: %s", version)
 
+        prompt_instance = dict(instance)
+        prompt_instance["_claude_max_steps"] = args.max_steps
+        prompt = build_prompt(prompt_instance)
         cmd = [
             str(claude_container_bin(args)),
             "--bare",
@@ -458,14 +638,61 @@ def solve_instance(
             "--no-session-persistence",
             "--permission-mode",
             args.permission_mode,
-            "--allowedTools",
-            args.allowed_tools,
-            "--",
-            build_prompt(instance),
         ]
         if args.dangerously_skip_permissions:
-            cmd.insert(-4, "--dangerously-skip-permissions")
-        exit_code, claude_output, timed_out, elapsed = exec_capture(
+            cmd.append("--dangerously-skip-permissions")
+        cmd.extend(
+            [
+            "--allowedTools",
+            args.allowed_tools,
+            "--output-format",
+            args.trace_output_format,
+            ]
+        )
+        if args.trace_output_format == "stream-json":
+            cmd.append("--verbose")
+            if args.include_partial_messages:
+                cmd.append("--include-partial-messages")
+            if args.include_hook_events:
+                cmd.append("--include-hook-events")
+        cmd.extend(["--", prompt])
+        (trace_dir / "prompt.txt").write_text(prompt)
+        write_json(
+            trace_dir / "command.json",
+            {
+                "command": cmd,
+                "model": args.model,
+                "allowed_tools": args.allowed_tools,
+                "permission_mode": args.permission_mode,
+                "trace_output_format": args.trace_output_format,
+                "include_partial_messages": args.include_partial_messages,
+                "include_hook_events": args.include_hook_events,
+                "timeout_seconds": args.claude_timeout,
+                "max_steps": args.max_steps,
+                "container_name": container.name,
+                "container_id": container.id,
+                "claude_version": version,
+                "created_at": utc_now(),
+            },
+        )
+        write_json(
+            status_path,
+            {
+                "instance_id": test_spec.instance_id,
+                "run_id": args.run_id,
+                "status": "running",
+                "started_at": utc_now(),
+                "trace_dir": str(trace_dir),
+            },
+        )
+        (
+            exit_code,
+            claude_output,
+            timed_out,
+            elapsed,
+            stop_reason,
+            step_count,
+        ) = exec_capture(
             client,
             container.id,
             cmd,
@@ -473,6 +700,9 @@ def solve_instance(
             workdir=CONTAINER_WORKDIR,
             user=args.container_user,
             timeout=args.claude_timeout,
+            trace_stream_path=trace_dir / "claude.stream.jsonl",
+            trace_operations_path=trace_dir / "claude.operations.jsonl",
+            max_steps=args.max_steps,
         )
         logger.info(
             "Claude Code finished: exit_code=%s timed_out=%s elapsed=%.2fs",
@@ -480,7 +710,28 @@ def solve_instance(
             timed_out,
             elapsed,
         )
+        write_json(
+            status_path,
+            {
+                "instance_id": test_spec.instance_id,
+                "run_id": args.run_id,
+                "status": "claude_finished",
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+                "stop_reason": stop_reason,
+                "step_count": step_count,
+                "max_steps": args.max_steps,
+                "elapsed_seconds": elapsed,
+                "finished_at": utc_now(),
+                "trace_dir": str(trace_dir),
+            },
+        )
         logger.info("Claude Code output:\n%s", claude_output)
+        if stop_reason == "max_steps_exceeded":
+            raise RuntimeError(
+                f"Claude Code exceeded max_steps={args.max_steps} "
+                f"(observed {step_count} task_started events)"
+            )
         if timed_out:
             raise TimeoutError(
                 f"Claude Code timed out after {args.claude_timeout} seconds"
@@ -495,6 +746,24 @@ def solve_instance(
         logger.info("Collected patch bytes: %d", len(patch.encode("utf-8")))
         if diff_result.exit_code != 0:
             raise RuntimeError(f"git diff failed: {patch}")
+        (trace_dir / "patch.diff").write_text(patch)
+        write_json(
+            status_path,
+            {
+                "instance_id": test_spec.instance_id,
+                "run_id": args.run_id,
+                "status": "completed",
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+                "stop_reason": stop_reason,
+                "step_count": step_count,
+                "max_steps": args.max_steps,
+                "elapsed_seconds": elapsed,
+                "patch_bytes": len(patch.encode("utf-8")),
+                "finished_at": utc_now(),
+                "trace_dir": str(trace_dir),
+            },
+        )
         if args.skip_empty_patches and not patch.strip():
             logger.info("Skipping empty patch for %s", test_spec.instance_id)
             return None
@@ -503,6 +772,28 @@ def solve_instance(
             "model_patch": patch,
             "model_name_or_path": MODEL_NAME,
         }
+    except Exception as exc:
+        failed_status: dict[str, Any] = {}
+        if status_path.exists():
+            try:
+                failed_status = json.loads(status_path.read_text())
+            except json.JSONDecodeError:
+                failed_status = {}
+        failed_status.update(
+            {
+                "instance_id": test_spec.instance_id,
+                "run_id": args.run_id,
+                "status": "failed",
+                "error": repr(exc),
+                "finished_at": utc_now(),
+                "trace_dir": str(trace_dir),
+            }
+        )
+        write_json(
+            status_path,
+            failed_status,
+        )
+        raise
     finally:
         if container is not None and not args.keep_containers:
             cleanup_container(client, container, logger)
@@ -545,24 +836,52 @@ def main() -> None:
         print(f"No instances to solve. Predictions at {output}")
         return
 
-    client = docker.from_env()
     predictions = dict(existing)
-    for index, instance in enumerate(selected, start=1):
+    errors: list[tuple[str, str]] = []
+
+    def run_one(index: int, instance: dict[str, Any]) -> tuple[int, str, dict[str, Any] | None]:
         instance_id = instance[KEY_INSTANCE_ID]
-        print(f"[{index}/{len(selected)}] Solving {instance_id}")
-        prediction = solve_instance(client, instance, args)
-        if prediction is not None:
-            predictions[instance_id] = prediction
-            write_predictions(output, predictions)
-            print(
-                f"[{index}/{len(selected)}] Wrote patch for {instance_id} "
-                f"({len(prediction['model_patch'])} chars)"
-            )
-        else:
-            print(f"[{index}/{len(selected)}] No prediction written for {instance_id}")
+        client = docker.from_env()
+        try:
+            print(f"[{index}/{len(selected)}] Solving {instance_id}", flush=True)
+            prediction = solve_instance(client, instance, args)
+            return index, instance_id, prediction
+        finally:
+            client.close()
+
+    with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+        futures = {}
+        for index, instance in enumerate(selected, start=1):
+            future = executor.submit(run_one, index, instance)
+            futures[future] = instance[KEY_INSTANCE_ID]
+        for future in as_completed(futures):
+            future_instance_id = futures[future]
+            try:
+                index, instance_id, prediction = future.result()
+            except Exception as exc:
+                instance_id = future_instance_id
+                errors.append((instance_id, repr(exc)))
+                print(f"[error] {instance_id}: {exc!r}", flush=True)
+                continue
+            if prediction is not None:
+                predictions[instance_id] = prediction
+                write_predictions(output, predictions)
+                print(
+                    f"[{index}/{len(selected)}] Wrote patch for {instance_id} "
+                    f"({len(prediction['model_patch'])} chars)",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[{index}/{len(selected)}] No prediction written for {instance_id}",
+                    flush=True,
+                )
 
     write_predictions(output, predictions)
     print(f"Done. Predictions written to {output}")
+    if errors:
+        formatted = "\n".join(f"- {instance_id}: {error}" for instance_id, error in errors)
+        raise RuntimeError(f"{len(errors)} instance(s) failed:\n{formatted}")
 
 
 if __name__ == "__main__":
