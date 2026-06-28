@@ -77,6 +77,7 @@ def run_instance(
     run_id: str,
     timeout: int | None = None,
     rewrite_reports: bool = False,
+    evaluation_log_dir: str | Path = RUN_EVALUATION_LOG_DIR,
 ) -> dict:
     """
     Run a single instance with the given prediction.
@@ -94,7 +95,7 @@ def run_instance(
     # Set up logging directory
     instance_id = test_spec.instance_id
     model_name_or_path = pred.get(KEY_MODEL, "None").replace("/", "__")
-    log_dir = RUN_EVALUATION_LOG_DIR / run_id / model_name_or_path / instance_id
+    log_dir = Path(evaluation_log_dir) / run_id / model_name_or_path / instance_id
 
     # Set up report file
     report_path = log_dir / LOG_REPORT
@@ -286,6 +287,7 @@ def run_instances(
     instance_image_tag: str = "latest",
     env_image_tag: str = "latest",
     rewrite_reports: bool = False,
+    evaluation_log_dir: str | Path = RUN_EVALUATION_LOG_DIR,
 ):
     """
     Run all instances for the given predictions in parallel.
@@ -344,6 +346,7 @@ def run_instances(
                 run_id,
                 timeout,
                 rewrite_reports,
+                evaluation_log_dir,
             )
         )
 
@@ -378,6 +381,7 @@ def get_dataset_from_preds(
     predictions: dict,
     run_id: str,
     rewrite_reports: bool,
+    evaluation_log_dir: str | Path = RUN_EVALUATION_LOG_DIR,
     exclude_completed: bool = True,
 ):
     """
@@ -417,7 +421,7 @@ def get_dataset_from_preds(
                 continue
             prediction = predictions[instance[KEY_INSTANCE_ID]]
             test_output_file = (
-                RUN_EVALUATION_LOG_DIR
+                Path(evaluation_log_dir)
                 / run_id
                 / prediction["model_name_or_path"].replace("/", "__")
                 / prediction[KEY_INSTANCE_ID]
@@ -441,7 +445,7 @@ def get_dataset_from_preds(
             continue
         prediction = predictions[instance[KEY_INSTANCE_ID]]
         report_file = (
-            RUN_EVALUATION_LOG_DIR
+            Path(evaluation_log_dir)
             / run_id
             / prediction[KEY_MODEL].replace("/", "__")
             / prediction[KEY_INSTANCE_ID]
@@ -502,10 +506,12 @@ def main(
 
     # set open file limit
     assert len(run_id) > 0, "Run ID must be provided"
-    if report_dir is not None:
-        report_dir = Path(report_dir)
-        if not report_dir.exists():
-            report_dir.mkdir(parents=True)
+    report_dir_path = Path(".") if report_dir is None else Path(report_dir)
+    if report_dir_path != Path("."):
+        report_dir_path.mkdir(parents=True, exist_ok=True)
+    evaluation_log_dir = (
+        RUN_EVALUATION_LOG_DIR if report_dir_path == Path(".") else report_dir_path
+    )
 
     if force_rebuild and namespace is not None:
         raise ValueError("Cannot force rebuild and use a namespace at the same time.")
@@ -516,7 +522,7 @@ def main(
 
     # get dataset from predictions
     dataset = get_dataset_from_preds(
-        dataset_name, split, instance_ids, predictions, run_id, rewrite_reports
+        dataset_name, split, instance_ids, predictions, run_id, rewrite_reports, evaluation_log_dir
     )
     full_dataset = load_swebench_dataset(dataset_name, split, instance_ids)
 
@@ -562,6 +568,7 @@ def main(
             instance_image_tag=instance_image_tag,
             env_image_tag=env_image_tag,
             rewrite_reports=rewrite_reports,
+            evaluation_log_dir=evaluation_log_dir,
         )
 
     # clean images + make final report
@@ -574,6 +581,8 @@ def main(
         namespace,
         instance_image_tag,
         env_image_tag,
+        report_dir_path,
+        evaluation_log_dir,
     )
 
 

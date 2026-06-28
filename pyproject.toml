@@ -27,6 +27,7 @@ dependencies = [
     "docker",
     "ghapi",
     "GitPython",
+    "litellm[proxy]",
     "modal",
     "pre-commit",
     "python-dotenv",
@@ -75,6 +76,10 @@ docs = [
     "pymdown-extensions",
     "mkdocs-include-markdown-plugin",
 ]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
 
 [tool.setuptools]
 include-package-data = true

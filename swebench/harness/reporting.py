@@ -22,6 +22,8 @@ def make_run_report(
     namespace: str = None,
     instance_image_tag: str = "latest",
     env_image_tag: str = "latest",
+    report_dir: str | Path | None = ".",
+    evaluation_log_dir: str | Path = RUN_EVALUATION_LOG_DIR,
 ) -> Path:
     """
     Make a final evaluation and run report of the instances that have been run.
@@ -59,7 +61,7 @@ def make_run_report(
             empty_patch_ids.add(instance_id)
             continue
         report_file = (
-            RUN_EVALUATION_LOG_DIR
+            Path(evaluation_log_dir)
             / run_id
             / prediction[KEY_MODEL].replace("/", "__")
             / prediction[KEY_INSTANCE_ID]
@@ -149,11 +151,14 @@ def make_run_report(
                 "unremoved_images": list(sorted(unremoved_images)),
             }
         )
-    report_file = Path(
+    report_name = (
         list(predictions.values())[0][KEY_MODEL].replace("/", "__")
         + f".{run_id}"
         + ".json"
     )
+    report_dir_path = Path(".") if report_dir is None else Path(report_dir)
+    report_dir_path.mkdir(parents=True, exist_ok=True)
+    report_file = report_dir_path / report_name
     with open(report_file, "w") as f:
         print(json.dumps(report, indent=4), file=f)
     print(f"Report written to {report_file}")

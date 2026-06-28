@@ -38,7 +38,7 @@ DEFAULT_BASE_URL = "http://127.0.0.1:30010"
 DEFAULT_MODEL = "Qwen3.6-27B-FP8"
 DEFAULT_CONTAINER_USER = "claude"
 DEFAULT_CONTAINER_HOME = "/home/claude"
-DEFAULT_TRACE_DIR = "/raid/zwx/SWE-bench/experiments/claude_qwen/traces"
+DEFAULT_TRACE_DIR = "/raid/zwx/SWE-bench/experiments/claude/traces"
 
 
 def parse_args() -> argparse.Namespace:
@@ -159,8 +159,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--claude_timeout",
         type=int,
-        default=1800,
-        help="Timeout in seconds for each Claude Code solve attempt.",
+        default=None,
+        help=(
+            "Timeout in seconds for each Claude Code solve attempt. "
+            "Omit to run without a wall-clock timeout."
+        ),
     )
     parser.add_argument(
         "--max_timeout",
@@ -227,6 +230,8 @@ def parse_args() -> argparse.Namespace:
         args.claude_timeout = args.max_timeout
     if args.max_workers < 1:
         parser.error("--max_workers must be at least 1")
+    if args.claude_timeout is not None and args.claude_timeout < 1:
+        parser.error("--claude_timeout/--max_timeout must be at least 1 when set")
     if args.max_steps is not None and args.max_steps < 1:
         parser.error("--max_steps must be at least 1")
     return args
@@ -242,12 +247,25 @@ def load_existing_predictions(path: Path) -> dict[str, dict[str, Any]]:
 def write_predictions(path: Path, predictions: dict[str, dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     ordered = sorted(predictions.values(), key=lambda item: item[KEY_INSTANCE_ID])
-    path.write_text(json.dumps(ordered, indent=2, ensure_ascii=False) + "\n")
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_text(json.dumps(ordered, indent=2, ensure_ascii=False) + "\n")
+    tmp_path.replace(path)
 
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def prediction_from_patch(
+    instance_id: str,
+    patch: str,
+) -> dict[str, Any]:
+    return {
+        KEY_INSTANCE_ID: instance_id,
+        "model_patch": patch,
+        "model_name_or_path": MODEL_NAME,
+    }
 
 
 def utc_now() -> str:
@@ -368,6 +386,32 @@ fi
         raise RuntimeError(f"Failed to prepare container user {user}: {output}")
 
 
+def ensure_git_baseline(container: Any, args: argparse.Namespace) -> None:
+    script = """
+set -eu
+cd /testbed
+git config --global --add safe.directory /testbed || true
+if git -c safe.directory=/testbed rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -c safe.directory=/testbed config core.fileMode false
+  exit 0
+fi
+git init -q
+git config user.email 'claude-code@example.invalid'
+git config user.name 'Claude Code Runner'
+git config core.fileMode false
+git add -A -f .
+git commit -q --allow-empty -m 'baseline'
+"""
+    result = container.exec_run(
+        ["/bin/bash", "-c", script],
+        user=args.container_user,
+        environment={"HOME": args.container_home},
+    )
+    output = result.output.decode("utf-8", errors="replace")
+    if result.exit_code != 0:
+        raise RuntimeError(f"Failed to initialize /testbed git baseline: {output}")
+
+
 def exec_capture(
     client: docker.DockerClient,
     container_id: str,
@@ -484,6 +528,53 @@ def exec_capture(
 
 def make_trace_dir(args: argparse.Namespace, instance_id: str) -> Path:
     return Path(args.trace_dir) / args.run_id / instance_id
+
+
+def collect_patch(
+    container: Any,
+    args: argparse.Namespace,
+    trace_dir: Path,
+    logger: logging.Logger,
+) -> tuple[str, str | None]:
+    """Collect git diff from /testbed and always write trace_dir/patch.diff."""
+    try:
+        diff_result = container.exec_run(
+            ["git", "-C", "/testbed", "-c", "core.fileMode=false", "diff"],
+            user=args.container_user,
+            environment={"HOME": args.container_home},
+        )
+        patch = diff_result.output.decode("utf-8", errors="replace")
+        (trace_dir / "patch.diff").write_text(patch)
+        logger.info("Collected patch bytes: %d", len(patch.encode("utf-8")))
+        if diff_result.exit_code != 0:
+            return patch, f"git diff failed with exit code {diff_result.exit_code}"
+        return patch, None
+    except Exception as exc:
+        error = f"git diff collection failed: {exc!r}"
+        logger.exception(error)
+        try:
+            (trace_dir / "patch.diff").write_text("")
+        except Exception:
+            logger.exception("Failed to write empty patch.diff after collection error")
+        return "", error
+
+
+def is_empty_final_response_failure(trace_dir: Path) -> bool:
+    stream_path = trace_dir / "claude.stream.jsonl"
+    if not stream_path.exists():
+        return False
+    needle = (
+        "[ede_diagnostic] result_type=assistant "
+        "last_content_type=none stop_reason=end_turn"
+    )
+    try:
+        with stream_path.open("r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if needle in line:
+                    return True
+    except OSError:
+        return False
+    return False
 
 
 def create_solve_container(
@@ -625,6 +716,8 @@ def solve_instance(
 
         version = install_claude(container, args)
         logger.info("Claude Code version in container: %s", version)
+        ensure_git_baseline(container, args)
+        logger.info("/testbed git baseline is ready")
 
         prompt_instance = dict(instance)
         prompt_instance["_claude_max_steps"] = args.max_steps
@@ -727,6 +820,10 @@ def solve_instance(
             },
         )
         logger.info("Claude Code output:\n%s", claude_output)
+        patch, patch_error = collect_patch(container, args, trace_dir, logger)
+        patch_bytes = len(patch.encode("utf-8"))
+        if patch_error is not None:
+            raise RuntimeError(patch_error)
         if stop_reason == "max_steps_exceeded":
             raise RuntimeError(
                 f"Claude Code exceeded max_steps={args.max_steps} "
@@ -736,17 +833,18 @@ def solve_instance(
             raise TimeoutError(
                 f"Claude Code timed out after {args.claude_timeout} seconds"
             )
+        tolerated_empty_final_response = False
         if exit_code != 0:
-            raise RuntimeError(f"Claude Code failed with exit code {exit_code}")
-
-        diff_result = container.exec_run(
-            "git -C /testbed -c core.fileMode=false diff", user="root"
-        )
-        patch = diff_result.output.decode("utf-8", errors="replace")
-        logger.info("Collected patch bytes: %d", len(patch.encode("utf-8")))
-        if diff_result.exit_code != 0:
-            raise RuntimeError(f"git diff failed: {patch}")
-        (trace_dir / "patch.diff").write_text(patch)
+            tolerated_empty_final_response = (
+                bool(patch.strip()) and is_empty_final_response_failure(trace_dir)
+            )
+            if not tolerated_empty_final_response:
+                raise RuntimeError(f"Claude Code failed with exit code {exit_code}")
+            logger.warning(
+                "Tolerating Claude Code exit_code=%s because a non-empty patch "
+                "was collected and the only terminal failure was an empty final response",
+                exit_code,
+            )
         write_json(
             status_path,
             {
@@ -759,7 +857,8 @@ def solve_instance(
                 "step_count": step_count,
                 "max_steps": args.max_steps,
                 "elapsed_seconds": elapsed,
-                "patch_bytes": len(patch.encode("utf-8")),
+                "patch_bytes": patch_bytes,
+                "tolerated_empty_final_response": tolerated_empty_final_response,
                 "finished_at": utc_now(),
                 "trace_dir": str(trace_dir),
             },
@@ -767,11 +866,7 @@ def solve_instance(
         if args.skip_empty_patches and not patch.strip():
             logger.info("Skipping empty patch for %s", test_spec.instance_id)
             return None
-        return {
-            KEY_INSTANCE_ID: test_spec.instance_id,
-            "model_patch": patch,
-            "model_name_or_path": MODEL_NAME,
-        }
+        return prediction_from_patch(test_spec.instance_id, patch)
     except Exception as exc:
         failed_status: dict[str, Any] = {}
         if status_path.exists():
@@ -779,6 +874,16 @@ def solve_instance(
                 failed_status = json.loads(status_path.read_text())
             except json.JSONDecodeError:
                 failed_status = {}
+        if container is not None:
+            patch_path = trace_dir / "patch.diff"
+            if not patch_path.exists():
+                patch, patch_error = collect_patch(container, args, trace_dir, logger)
+            else:
+                patch = patch_path.read_text(encoding="utf-8", errors="replace")
+                patch_error = None
+            failed_status["patch_bytes"] = len(patch.encode("utf-8"))
+            if patch_error is not None:
+                failed_status["patch_collection_error"] = patch_error
         failed_status.update(
             {
                 "instance_id": test_spec.instance_id,
@@ -862,6 +967,17 @@ def main() -> None:
                 instance_id = future_instance_id
                 errors.append((instance_id, repr(exc)))
                 print(f"[error] {instance_id}: {exc!r}", flush=True)
+                patch_path = make_trace_dir(args, instance_id) / "patch.diff"
+                if patch_path.exists():
+                    patch = patch_path.read_text(encoding="utf-8", errors="replace")
+                    if patch.strip() or not args.skip_empty_patches:
+                        predictions[instance_id] = prediction_from_patch(instance_id, patch)
+                        write_predictions(output, predictions)
+                        print(
+                            f"[{instance_id}] Recovered patch from failed run "
+                            f"and wrote prediction ({len(patch)} chars)",
+                            flush=True,
+                        )
                 continue
             if prediction is not None:
                 predictions[instance_id] = prediction

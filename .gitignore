@@ -170,3 +170,11 @@ cython_debug/
 data/repos/copies
 notebooks/
 *logs/
+
+# Claude SWE-bench experiments
+experiments/claude/traces/
+experiments/claude/**/*.log
+experiments/claude/**/__pycache__/
+experiments/claude/predictions*.json
+experiments/claude/*.bak*
+experiments/claude_qwen.backup.*/
