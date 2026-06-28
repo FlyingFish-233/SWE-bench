@@ -66,8 +66,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        required=True,
-        help="Predictions JSON path to write/update.",
+        help=(
+            "Predictions JSON path to write/update. Defaults to "
+            "<trace_dir>/<run_id>/predictions.json."
+        ),
     )
     parser.add_argument(
         "--trace_dir",
@@ -526,8 +528,18 @@ def exec_capture(
             trace_operations_file.close()
 
 
+def make_run_trace_dir(args: argparse.Namespace) -> Path:
+    return Path(args.trace_dir) / args.run_id
+
+
 def make_trace_dir(args: argparse.Namespace, instance_id: str) -> Path:
-    return Path(args.trace_dir) / args.run_id / instance_id
+    return make_run_trace_dir(args) / instance_id
+
+
+def make_output_path(args: argparse.Namespace) -> Path:
+    if args.output:
+        return Path(args.output)
+    return make_run_trace_dir(args) / "predictions.json"
 
 
 def collect_patch(
@@ -930,7 +942,7 @@ def select_instances(
 
 def main() -> None:
     args = parse_args()
-    output = Path(args.output)
+    output = make_output_path(args)
     existing = load_existing_predictions(output)
     dataset = load_swebench_dataset(args.dataset_name, args.split, args.instance_ids)
     selected = select_instances(dataset, args, existing)
