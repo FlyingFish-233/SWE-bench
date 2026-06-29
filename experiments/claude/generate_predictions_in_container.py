@@ -34,11 +34,12 @@ from swebench.harness.utils import load_swebench_dataset, optional_str
 MODEL_NAME = "claude-code-qwen3.6-27b-fp8-container"
 CONTAINER_WORKDIR = "/testbed"
 DEFAULT_ALLOWED_TOOLS = "Bash Edit Read Write Grep Glob LS"
-DEFAULT_BASE_URL = "http://127.0.0.1:30010"
+DEFAULT_BASE_URL = "http://172.17.0.1:30011"
 DEFAULT_MODEL = "Qwen3.6-27B-FP8"
 DEFAULT_CONTAINER_USER = "claude"
 DEFAULT_CONTAINER_HOME = "/home/claude"
 DEFAULT_TRACE_DIR = "/raid/zwx/SWE-bench/experiments/claude/traces"
+DEFAULT_CONTAINER_NETWORK = "bridge"
 
 
 def parse_args() -> argparse.Namespace:
@@ -140,6 +141,14 @@ def parse_args() -> argparse.Namespace:
         help="Anthropic-compatible API base URL visible from the container.",
     )
     parser.add_argument(
+        "--container_network",
+        default=DEFAULT_CONTAINER_NETWORK,
+        help=(
+            "Docker network mode/name for solve containers. Defaults to bridge "
+            "so containers can reach the host docker0 gateway without host networking."
+        ),
+    )
+    parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
         help="Model name to pass to Claude Code.",
@@ -179,9 +188,9 @@ def parse_args() -> argparse.Namespace:
         "--max_steps",
         type=int,
         help=(
-            "Maximum number of Claude Code tool-task steps per instance. "
-            "Counts stream-json system/task_started events and terminates the "
-            "Claude exec when the limit is exceeded."
+            "Maximum number of Claude Code assistant messages per instance. "
+            "Counts stream-json type=assistant events and terminates the Claude "
+            "exec when the limit is exceeded. Omit for no limit."
         ),
     )
     parser.add_argument(
@@ -479,12 +488,13 @@ def exec_capture(
                                 json.dumps(event, ensure_ascii=False) + "\n"
                             )
                             trace_operations_file.flush()
-                        if (
-                            event.get("type") == "system"
-                            and event.get("subtype") == "task_started"
-                        ):
+                        if event.get("type") == "assistant":
                             step_count += 1
-                            if step_count > max_steps and stop_reason is None:
+                            if (
+                                max_steps is not None
+                                and step_count > max_steps
+                                and stop_reason is None
+                            ):
                                 stop_reason = "max_steps_exceeded"
                                 inspect = client.api.exec_inspect(exec_id)
                                 pid = inspect.get("Pid")
@@ -593,6 +603,7 @@ def create_solve_container(
     client: docker.DockerClient,
     test_spec: TestSpec,
     run_id: str,
+    container_network: str,
 ) -> Any:
     name = f"claude.solve.{run_id}.{test_spec.instance_id}".lower()
     try:
@@ -611,7 +622,7 @@ def create_solve_container(
         command="tail -f /dev/null",
         platform=test_spec.platform,
         cap_add=cap_add,
-        network_mode="host",
+        network_mode=container_network,
         working_dir=CONTAINER_WORKDIR,
     )
 
@@ -722,7 +733,9 @@ def solve_instance(
     try:
         logger.info("Starting solve for %s", test_spec.instance_id)
         ensure_instance_image(client, test_spec, logger, args.force_rebuild)
-        container = create_solve_container(client, test_spec, args.run_id)
+        container = create_solve_container(
+            client, test_spec, args.run_id, args.container_network
+        )
         container.start()
         logger.info("Solve container started: %s (%s)", container.name, container.id)
 

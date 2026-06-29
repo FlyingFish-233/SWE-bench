@@ -12,7 +12,8 @@ run_id="${RUN_ID:-claude-verified-$ts}"
 predictions_path="${PREDICTIONS_PATH:-$trace_dir/$run_id/predictions.json}"
 eval_run_id="${EVAL_RUN_ID:-$run_id-eval}"
 report_dir="${REPORT_DIR:-experiments/claude/evaluation_reports}"
-anthropic_base_url="${ANTHROPIC_BASE_URL:-http://127.0.0.1:30011}"
+anthropic_base_url="${ANTHROPIC_BASE_URL:-http://172.17.0.1:30011}"
+container_network="${CONTAINER_NETWORK:-bridge}"
 max_steps="${MAX_STEPS:-100}"
 max_workers="${MAX_WORKERS:-4}"
 eval_max_workers="${EVAL_MAX_WORKERS:-$max_workers}"
@@ -30,7 +31,7 @@ prediction_args=(
   --run_id "$run_id"
   --trace_dir "$trace_dir"
   --anthropic_base_url "$anthropic_base_url"
-  --max_steps "$max_steps"
+  --container_network "$container_network"
   --max_workers "$max_workers"
 )
 
@@ -51,6 +52,10 @@ if ((${#instance_ids[@]})); then
   evaluation_args+=(--instance_ids "${instance_ids[@]}")
 fi
 
+if [[ -n "$max_steps" ]]; then
+  prediction_args+=(--max_steps "$max_steps")
+fi
+
 if [[ -n "$limit" ]]; then
   prediction_args+=(--limit "$limit")
 fi
@@ -68,6 +73,8 @@ echo "Split: $split"
 echo "Run ID: $run_id"
 echo "Predictions: $predictions_path"
 echo "Trace dir: $trace_dir/$run_id"
+echo "Anthropic base URL: $anthropic_base_url"
+echo "Container network: $container_network"
 if ((${#instance_ids[@]})); then
   echo "Instances: ${instance_ids[*]}"
 else
